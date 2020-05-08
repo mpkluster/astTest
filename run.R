@@ -97,7 +97,7 @@ finplot = function( gmap, d, title, alpha=0.6, bins=100, heatmap=0) {
       scale_fill_gradient(name = "Data points count", low = "blue", high = "red") 
   }
   else {
-    fin_map = fin_map + geom_point(aes(xf, yf), data = d, colour) 
+    fin_map = fin_map + geom_point(aes(xf, yf), data = d, colour = "blue") 
   }
   
   fin_map = fin_map + 
@@ -322,7 +322,7 @@ getWorkingSessions = function( selectedTractor, idleTimeInMinutes ) {
           *
           , lead(dateTime) over (partition by serialNumber order by dateTime) AS nextRow
           , ABS(TIMEDIFF(minute, dateTime, nextRow)) timedifference
-          , IFF(timeDifference <= @{idleTimeInMinutes}, 1, 2) symb
+          , COALESCE( IFF(timeDifference <= @{idleTimeInMinutes}, 1, 2), 1) symb
       FROM temp.public.allData_1minSampling
       WHERE serialNumber = \'@{selectedTractor}\'
       ORDER BY dateTime
@@ -379,7 +379,15 @@ d = as.data.frame( cbind(x,y) )
 g = ggplot(d, aes(x=x, y=y) ) +
   geom_bin2d(bins = 80) +
   scale_fill_continuous(type = "viridis") +
-  theme_grey()
+  theme_grey() +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_text(face="bold", color="#993333", size=14),
+        axis.text.y = element_text(face="bold", color="#993333", size=14),
+        legend.text = element_text(size=15),
+        legend.title = element_text(size=15)
+  )
 plot(g)
 
 # sampled each 10 minutes
@@ -507,7 +515,7 @@ for ( l in 1:length(limits) ) {
   
   # distance heatmap
   h=hist2d(xn, yn, nbins=c(bins_x,bins_y), same.scale=FALSE, col=c("white", heat.colors(20)))
-  append(zonesHistograms, h)
+  zonesHistograms[[l]] = h
   # dph = as.data.frame( cbind(h$x, h$y) )
   # distance <- get_dist(dph)
   # fviz_dist(distance, gradient = list(low = "#00AFBB", mid = "white", high = "#FC4E07"))
@@ -521,8 +529,8 @@ for ( l in 1:length(limits) ) {
   #nbsl = fviz_nbclust(dn, kmeans, method = "silhouette") # option 3
   #nbwsDp = fviz_nbclust(dp, kmeans, method = "wss", k.max = maxClusters) 
   
-  append(elbowPlots, nbws)
-  #plot(nbwsDp)
+  elbowPlots[[l]] = nbws
+  plot(nbws)
   
   # get the optimal number of clusters for both the filtered 
   # (only where the consumption is high) and the unfiltered data
@@ -549,10 +557,13 @@ for ( l in 1:length(limits) ) {
     ggsn::scalebar(dn, dist = 5, dist_unit = "km", transform = TRUE, model = "WGS84", location = "bottomright")
   plot(g)
   
-  append(heatmapsClusters, g)
+  heatmapsClusters[[l]] = g
   
   fields_centers = as.data.frame( rbind(fields_centers, clust$C) ) #, cm$centers
 }
+
+plot( elbowPlots )
+length(elbowPlots)
 
 # check manually some cluster center
 # get_geo_distance(20.181258,45.318750,20.351847,45.324694,'km')
@@ -560,6 +571,11 @@ for ( l in 1:length(limits) ) {
 rownames(fields_centers) = NULL
 colnames(fields_centers) = c("x", "y")
 #fields_centers
+
+## ###########################################################################################
+## ###########################################################################################
+## ###########################################################################################
+## ###########################################################################################
 
 ## add new column in the data frame (the slow way)
 # distances_holder = matrix(rep(0,nrow(fields_centers)),ncol=1)
@@ -596,8 +612,8 @@ colnames(fields_centers) = c("x", "y")
 X = as.data.frame( rep(0,nrow(dataOrderedSampled1m)) )
 colnames(X) = c("IsInTheField")
 dataOrderedSampled1m$IsInTheField = X
-#dataOrderedSampled1m = cbind(dataOrderedSampled1m, X)
 
+# prepare the apply functions to get rid of for loops
 getDistKm = function(x,y,...) {
   additional.args <- list(...)
   x1 <- additional.args[[1]]
@@ -626,13 +642,14 @@ fillColumnIsInTheField <- function(x,y,...) {
   classifier_value
 }
 
-# compute the distances to the fields centers (the most computing intensive step)
+# compute the distances to the fields centers (the most computing intensive step - can take up to 20 min)
 plan(multiprocess)
 dataOrderedSampled1m$IsInTheField <- future.apply::future_mapply(fillColumnIsInTheField,
-                                                                 dataOrderedSampled1m$GPSLONGITUDE, 
-                                                                 dataOrderedSampled1m$GPSLATITUDE, 
+                                                                 dataOrderedSampled1m$GPSLONGITUDE,
+                                                                 dataOrderedSampled1m$GPSLATITUDE,
                                                                  MoreArgs = list( cx=fields_centers$x, cy=fields_centers$y )
                                                                 )
+
 # check how many events were recorded on the field and how many on the street
 nrow(dataOrderedSampled1m)
 nrow(dataOrderedSampled1m %>% filter(IsInTheField == 1))
@@ -647,25 +664,36 @@ nrow(dataOrderedSampled1m)-nrow(dataOrderedSampled1m %>% filter(IsInTheField == 
 # get the distinct tractors serial numbers
 distinctSerials = as.vector( pull( dataOrdered %>% distinct(SERIALNUMBER) ) )
 
-# Time series analysis
-for ( serial in 1:length(distinctSerials) ) {
-}
+## Time series analysis
+
+# count the time transporting for each tractor
+transportTimeList = as.vector(rep(0,length(distinctSerials)))
+activityTimeList  = as.vector(rep(0,length(distinctSerials)))
+
+singlePathsContainerList = list()
+
+for ( tractorCounter in 1:length(distinctSerials) ) {
     
+    serial = distinctSerials[tractorCounter]
     # combine with the data processed earlier
+    # choose 2 hours as the lag parameter
     df_temp = getWorkingSessions(serial, 120)
     column = as.vector( (dataOrderedSampled1m %>% filter(SERIALNUMBER == serial) %>% arrange(DATETIME))$IsInTheField )
     column_df = as.data.frame( column )
     colnames(column_df) = c("ISINTHEFIELD")
     df = cbind( df_temp, column_df )
     
-    
+    if ( nrow(df) == 0 ) {
+      print(GetoptLong::qq("Something's wrong with the query for the tractor @{serial}"))
+      break
+    }
     # now extract each tractor daily (or multi days) working path
     emptyVec = rep(0L, nrow(df))
     counter = 1
     
     for ( i in 1:nrow(df) ) {
       emptyVec[i] = counter
-      if ( df[i,"SYMB"] == 2 ) {
+      if ( df$SYMB[i] == 2 ) {
         counter = counter + 1
       }
     }
@@ -675,14 +703,8 @@ for ( serial in 1:length(distinctSerials) ) {
     # View(df[1:250,])
     
     # plot the histogram to see if there are some overnighters
-    hist(dfCombined$emptyVec, breaks=length(l))
-    max(dfCombined$emptyVec)
-    
-    # get a sample (exploratory)
-    # groupId = 4
-    # singlePath = dfCombined %>% filter(emptyVec == groupId) %>% arrange(DATETIME)
-    # nrow(singlePath)
-    # plot(singlePath$GPSLONGITUDE,singlePath$GPSLATITUDE)
+    #hist(dfCombined$emptyVec, breaks=length(l))
+    #max(dfCombined$emptyVec)
 
     # a lot of single paths are short and with no movement (hence discard them)
     singlePathsContainer = list()
@@ -694,75 +716,202 @@ for ( serial in 1:length(distinctSerials) ) {
         counter = counter + 1
       }
     }
-    length(singlePathsContainer)
-
-    singlePathN = 201
-    plotSinglePath( singlePathsContainer[[singlePathN]], serial )
     
-    singleRun = singlePathsContainer[[singlePathN]] 
-    nrow(singleRun)
-    sum(singleRun$SYMB)-1
-    max(singleRun$DATETIME) 
-    min(singleRun$DATETIME)
-    sum((singleRun %>% filter(singleRun$ISINTHEFIELD == 1))$SYMB)-1
+    singlePathsContainerList[[tractorCounter]] = singlePathsContainer
     
-    (max(singleRun$TOTALWORKINGHOURS) - min(singleRun$TOTALWORKINGHOURS)) * 60
-    
-    
-    ( as.integer(as.POSIXct( max(singleRun$DATETIME) )) -
-      as.integer(as.POSIXct( min(singleRun$DATETIME) )) )/60
-    
-    singleRun %>% distinct(SYMB)
-    singleRun %>% distinct(TIMEDIFFERENCE)
-    singleRun %>% max(SYMB)
-    
-    for ( j in 1:3 ) { #length(singlePathsContainer)
-      singleRun = singlePathsContainer[[j]] 
-      print(singleRun %>% count(SYMB))
+    for ( i in 1:length(singlePathsContainer) ) {
+      singleRun = singlePathsContainer[[i]] 
+      totalTime = sum(singleRun$SYMB)-1
+      activityTime = sum((singleRun %>% filter(singleRun$ISINTHEFIELD == 1))$SYMB)-1
+      transportTime = totalTime - activityTime
+      
+      transportTimeList[tractorCounter] = transportTimeList[tractorCounter] + transportTime
+      activityTimeList[tractorCounter] = activityTimeList[tractorCounter] + activityTime
     }
+}
+
+## ###########################################################################################
+## ###########################################################################################
+## ###########################################################################################
+## ###########################################################################################
+
+## ====================================================
+# Question 1)
+
+tt = sum(transportTimeList)/60
+at = sum(activityTimeList)/60
+ct = at + tt
+tt/ct*100
+at/ct*100
+tt
+at
+ct
+
+totals = as.vector( as.numeric(round((transportTimeList + activityTimeList)/60,2)) )
+totals
+## compute the error we made comparing to the totalWorkingHours field (SUM)
+df = data.frame( distinctSerials, totals )
+colnames(df) = c("SERIALNUMBER", "TOTAL")
+df = df %>% arrange(SERIALNUMBER)
+fromSnowflake = sfSql("
+  SELECT 
+    serialNumber
+    , ROUND(MAX(totalworkingHours) - MIN(totalworkingHours), 2) as total
+  FROM temp.public.allData
+  GROUP BY 1
+  ORDER BY serialNumber
+")
+fromSnowflake = fromSnowflake %>% arrange(SERIALNUMBER)
+df$TOTALFROMSW = as.numeric(fromSnowflake$TOTAL)
+df$error = round((as.numeric(df$TOTALFROMSW) - as.numeric(df$TOTAL))/as.numeric(df$TOTALFROMSW)*100, 2)
+df
+
+
+## ====================================================
+# Question 2) How many fields?
+
+zonesHistograms = list()
+
+# loop over the 3 different zones
+for ( l in 1:length(limits) ) {
+  lim = limits[[l]]
+  
+  dataFiltered = dataOrderedSampled1m %>%
+    filter( GPSLONGITUDE >= lim$left &
+              GPSLONGITUDE <= lim$right &
+              GPSLATITUDE >= lim$bottom &
+              GPSLATITUDE <= lim$top &
+              IsInTheField == 1
+          ) %>%
+    arrange(DATETIME)
+  
+  xn = dataFiltered$GPSLONGITUDE
+  yn = dataFiltered$GPSLATITUDE
+  
+  # first create ~400x400m bins
+  bins_y = (lim$top - lim$bottom)/(1/240)
+  bins_x = (lim$right - lim$left)/(1/240)
+  
+  # distance heatmap
+  h=hist2d(xn, yn, nbins=c(bins_x,bins_y), same.scale=FALSE, col=c("white", heat.colors(20)))
+  
+  zonesHistograms[[l]] = h
+}
+
+cutoff = 120
+h = zonesHistograms[[1]]$counts
+nrow(h)
+ncol(h)
+l1 = length( h[h>cutoff] )
+
+h = zonesHistograms[[2]]$counts
+nrow(h)
+ncol(h)
+l2 = length( h[h>cutoff] )
+
+h = zonesHistograms[[3]]$counts
+nrow(h)
+ncol(h)
+l3 = length( h[h>cutoff] )
+
+# Answer
+sum( c(l1, l2, l3) )
+
+## ====================================================
+# Question 3)
+
+distinctSerials = as.vector( pull( dataOrdered %>% distinct(SERIALNUMBER) ) )
+
+tractorActivitiesList = list()
+
+for ( tractorCounter in 1:length(distinctSerials) ) {
+
+  serial = distinctSerials[tractorCounter]
+  dataFiltered = dataOrderedSampled1m %>%
+    filter( IsInTheField == 1 &
+            SERIALNUMBER == serial
+    ) %>%
+    arrange(DATETIME)
+
+  speedAbove10 = nrow(dataFiltered %>% filter(SPEED_MA_30M > 10))
+  speedBelow10 = nrow(dataFiltered %>% filter(SPEED_MA_30M < 10))
+  
+  ptoRear  = nrow(dataFiltered %>% filter(PTOREAR_RPM > 0))
+  ptoFront = nrow(dataFiltered %>% filter(PTOFRONT_RPM > 10))
     
-    View(singleRun)
-    summary(singleRun)
+  activityList = list(serial=serial, speedAbove10=speedAbove10, speedBelow10=speedBelow10, ptoRear=ptoRear, ptoFront=ptoFront)
+  tractorActivitiesList[[tractorCounter]] = activityList
+}
+tractorActivitiesList
 
-    nrow(dataOrderedSampled1m %>% filter(PTOREAR_RPM > 0) )
+## ====================================================
+# Question 6)
 
-  plotSinglePath(singleRun, serial)
-
-
-head(dataOrderedSampled1m)
-
-dataForHCluster = dataOrderedSampled1m[, c("GPSLONGITUDE", "GPSLATITUDE", "ENGINE_RPM", "ENGINELOAD",
-                                         "FUELCONSUMPTION_L_H", "SPEEDGEARBOX_KM_H")] %>%
-                  filter(dataOrderedSampled1m$IsInTheField == 0 & 
-                         dataOrderedSampled1m$PARKINGBREAKSTATUS == 0 
-                           & dataOrderedSampled1m$TEMPAMBIENT_C > 20
-                        ) %>%
-                  drop_na()
-
-glimpse(dataForHCluster)
+# fuel save
+v = dataOrderedSampled1m %>% filter( dataOrderedSampled1m$IsInTheField == 0 )
+f = v$FUELCONSUMPTION_L_H
+f[ is.na(f) ] = 0
+mean(f)*tt
 
 
-xf = dataForHCluster$GPSLONGITUDE
-yf = dataForHCluster$GPSLATITUDE
-zf = dataForHCluster$FUELCONSUMPTION_L_H
-d = as.data.frame( cbind(xf, yf) )
-gmap = global_map
-bins = 200
-alpha = 0.6
-title = "Fuel consumption on the road"
 
-fin_map = ggmap(gmap) + 
-    stat_summary_2d(data = d, aes(x=xf, y=yf, z=zf ), fun = mean, alpha = alpha, bins = bins) + 
-    scale_fill_gradient(name = "Fuel consumption", low = "blue", high = "red") + 
-    ggtitle(title) +
-    xlab("Longitude") +
-    ylab("Latitude") +
-    theme(plot.title = element_text(hjust = 0.5),
-          axis.text.x = element_text(face="bold", color="#993333", size=10),
-          axis.text.y = element_text(face="bold", color="#993333", size=10),
-          panel.grid.major = element_line(colour="black", size=0.5),
-          panel.grid.minor = element_line(colour="black", size=0.5)
-    )
 
-fin_map
+# 
+# singlePathN = 4
+# plotSinglePath( singlePathsContainer[[singlePathN]], serial )
+# nrow(singleRun)
+# sum(singleRun$SYMB)-1
+# max(singleRun$DATETIME) 
+# min(singleRun$DATETIME)
+# 
+# (max(singleRun$TOTALWORKINGHOURS) - min(singleRun$TOTALWORKINGHOURS)) * 60
+# 
+# ( as.integer(as.POSIXct( max(singleRun$DATETIME) )) -
+#   as.integer(as.POSIXct( min(singleRun$DATETIME) )) )/60
+# 
+# singleRun %>% distinct(SYMB)
+# singleRun %>% distinct(TIMEDIFFERENCE)
+# 
+# View(singleRun)
+# summary(singleRun)
+# 
+# nrow(dataOrderedSampled1m %>% filter(PTOREAR_RPM > 0) )
+# 
+# plotSinglePath(singleRun, serial)
+# head(dataOrderedSampled1m)
+# 
+# dataForHCluster = dataOrderedSampled1m[, c("GPSLONGITUDE", "GPSLATITUDE", "ENGINE_RPM", "ENGINELOAD",
+#                                          "FUELCONSUMPTION_L_H", "SPEEDGEARBOX_KM_H")] %>%
+#                   filter(dataOrderedSampled1m$IsInTheField == 0 & 
+#                          dataOrderedSampled1m$PARKINGBREAKSTATUS == 0 
+#                            & dataOrderedSampled1m$TEMPAMBIENT_C > 20
+#                         ) %>%
+#                   drop_na()
+# 
+# glimpse(dataForHCluster)
+# 
+# 
+# xf = dataForHCluster$GPSLONGITUDE
+# yf = dataForHCluster$GPSLATITUDE
+# zf = dataForHCluster$FUELCONSUMPTION_L_H
+# d = as.data.frame( cbind(xf, yf) )
+# gmap = global_map
+# bins = 200
+# alpha = 0.6
+# title = "Fuel consumption on the road"
+# 
+# fin_map = ggmap(gmap) + 
+#     stat_summary_2d(data = d, aes(x=xf, y=yf, z=zf ), fun = mean, alpha = alpha, bins = bins) + 
+#     scale_fill_gradient(name = "Fuel consumption", low = "blue", high = "red") + 
+#     ggtitle(title) +
+#     xlab("Longitude") +
+#     ylab("Latitude") +
+#     theme(plot.title = element_text(hjust = 0.5),
+#           axis.text.x = element_text(face="bold", color="#993333", size=10),
+#           axis.text.y = element_text(face="bold", color="#993333", size=10),
+#           panel.grid.major = element_line(colour="black", size=0.5),
+#           panel.grid.minor = element_line(colour="black", size=0.5)
+#     )
+# 
+# fin_map
 

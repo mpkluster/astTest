@@ -99,9 +99,10 @@ SELECT
     , COUNT(DISTINCT to_date(dateTime)) daysOnRun
     , MIN(dateTime) startDate
     , MAX(dateTime) maxDate
-    , MIN(totalWorkingHours) startEffort
+    , MAX(totalWorkingHours) - MIN(totalWorkingHours) workingHours
 FROM temp.public.allData
-GROUP BY 1;
+GROUP BY 1
+ORDER BY 5 DESC;
 
 // check if some work is done at night
 SELECT
@@ -126,6 +127,23 @@ SELECT GEARSHIFT, DIFFERENTIALLOCKSTATUS, ALLWHEELDRIVESTATUS, COUNT(*) cnt
 FROM temp.public.allData 
 GROUP BY 1,2,3 
 ORDER BY cnt DESC;
+
+// ALLWHEELDRIVESTATUS analysis (which tractor is using what)
+SELECT 
+    serialNumber
+    , LISTAGG(DISTINCT ALLWHEELDRIVESTATUS, ', ') FourwheelDriveStatus
+FROM temp.public.allData 
+WHERE ALLWHEELDRIVESTATUS IS NOT NULL
+GROUP BY 1;
+
+SELECT 
+    serialNumber
+    , ALLWHEELDRIVESTATUS
+    , COUNT(*) cnt
+FROM temp.public.allData 
+WHERE ALLWHEELDRIVESTATUS IS NOT NULL
+GROUP BY 1,2
+ORDER BY 1, cnt DESC;
 
 
 // take the csv text output of this query and copy it into https://www.gpsvisualizer.com/map_input?form=google to plot the coordinates
@@ -716,9 +734,11 @@ WITH tmp AS (
         , to_date(dateTime) day
         , MIN(dateTime) minTIme
         , MAX(dateTime) maxTime
-        , ABS(timediff(seconds, maxtime, mintime)/3600) AS dayWorkingHours
+        , SUM(IFF(speed_ma_30m>10 AND fuel_ma_30m > 30, 1, 0)) above10 //ABS(timediff(seconds, maxtime, mintime)/3600) AS dayWorkingHours
+        , SUM(IFF(speed_ma_30m<10 AND fuel_ma_30m > 30, 1, 0)) below10
+        , ROUND(above10/below10, 5) ratio
         , COUNT(*) events
-    FROM temp.public.allData
+    FROM temp.public.allData_1minSampling //temp.public.allData
     GROUP BY 1,2
     ORDER BY 1,2
 )
@@ -726,7 +746,8 @@ WITH tmp AS (
     SELECT
         serialNumber
         , SUBSTRING(day::string, 1, 7) AS month
-        , SUM(dayWorkingHours) AS metric
+        , ROUND(SUM(above10)/NULLIF(SUM(below10),0), 5) metric
+//        , SUM(dayWorkingHours) AS metric
 //        , SUM(events) AS metric
     FROM tmp
     GROUP BY 1,2
@@ -738,6 +759,17 @@ PIVOT(sum(metric) for month in ('2018-12','2019-01','2019-02','2019-03','2019-04
       as p (serialNumber, dec2018, jan2019, feb2019, mar2019, apr2019, may2019, jun2019, jul2019, aug2019, sep2019, oct2019, nov2019, dec2019, jan2020, feb2020, mar2020, apr2020)
 ;
 
+// explore the fuel consumption
+SELECT 
+    serialNumber
+    , MAX(FUELCONSUMPTION_L_H) maxFuel
+    , AVG(FUELCONSUMPTION_L_H) avg
+    , MEDIAN(FUELCONSUMPTION_L_H) median
+    , COUNT(*) eventcnt
+FROM temp.public.allData
+GROUP BY 1
+//HAVING maxFuel>60
+ORDER BY maxFuel;
 
 
 // find days where all tractors were active at the same time
@@ -786,7 +818,7 @@ ORDER BY maxFUELCONSUMPTION
 ;
 
 
-// what is happening on the left edge of the map? ODG: nothing ... a tractor decided to take a long journey
+// Q: what is happening on the left edge of the map? A: nothing ... a tractor decided to take a long journey
 SELECT
     name,
     latitude,
